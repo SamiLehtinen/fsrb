@@ -1,0 +1,133 @@
+Here are three test files designed to be run sequentially to test Create, Modify, and Delete operations using `fsrb.ps1`.
+
+These scripts create a sandbox directory `fsrb_test_env` to avoid messing with your current files.
+
+### 1. `test_01_create.fsrb`
+**Action:** Creates 2 directories (`sub_a`, `sub_b`) inside `fsrb_test_env` with 2 files in each.
+
+```text
+fsrb_test_env/sub_a/file_1.txt
+<<<<<<< SEARCH
+=======
+Title: File One
+Status: Original
+Description: This is a text file.
+>>>>>>> REPLACE
+fsrb_test_env/sub_a/file_2.txt
+<<<<<<< SEARCH
+=======
+Title: File Two
+Status: Original
+Description: Another text file here.
+>>>>>>> REPLACE
+fsrb_test_env/sub_b/file_3.py
+<<<<<<< SEARCH
+=======
+def hello():
+    print("Hello from File 3")
+
+if __name__ == "__main__":
+    hello()
+>>>>>>> REPLACE
+fsrb_test_env/sub_b/file_4.py
+<<<<<<< SEARCH
+=======
+x = 10
+y = 20
+print(x + y)
+>>>>>>> REPLACE
+```
+
+### 2. `test_02_modify.fsrb`
+**Action:** Modifies all 4 files.
+- `file_1.txt`: Partial replacement (middle line).
+- `file_2.txt`: Full file replacement (content rewrite).
+- `file_3.py`: Partial replacement (modifies the function).
+- `file_4.py`: Partial replacement (changes variable values).
+
+```text
+fsrb_test_env/sub_a/file_1.txt
+<<<<<<< SEARCH
+Status: Original
+=======
+Status: Modified
+>>>>>>> REPLACE
+fsrb_test_env/sub_a/file_2.txt
+<<<<<<< SEARCH
+Title: File Two
+Status: Original
+Description: Another text file here.
+=======
+Title: File Two (Updated)
+Status: Completely Rewritten
+Description: The content has changed entirely.
+>>>>>>> REPLACE
+fsrb_test_env/sub_b/file_3.py
+<<<<<<< SEARCH
+def hello():
+    print("Hello from File 3")
+=======
+def hello():
+    print("Hello from File 3 - UPDATED")
+>>>>>>> REPLACE
+fsrb_test_env/sub_b/file_4.py
+<<<<<<< SEARCH
+x = 10
+y = 20
+=======
+x = 100
+y = 200
+>>>>>>> REPLACE
+```
+
+
+### 3. `test_03_delete.fsrb`
+**Action:** Deletes all files. The SEARCH blocks match the *result* of step 2.
+*Note: If the `fsrb` tool supports empty directory cleanup, the `fsrb_test_env` folders should also disappear.*
+
+```text
+fsrb_test_env/sub_a/file_1.txt
+<<<<<<< SEARCH
+Title: File One
+Status: Modified
+Description: This is a text file.
+=======
+>>>>>>> REPLACE
+fsrb_test_env/sub_a/file_2.txt
+<<<<<<< SEARCH
+Title: File Two (Updated)
+Status: Completely Rewritten
+Description: The content has changed entirely.
+=======
+>>>>>>> REPLACE
+fsrb_test_env/sub_b/file_3.py
+<<<<<<< SEARCH
+def hello():
+    print("Hello from File 3 - UPDATED")
+
+if __name__ == "__main__":
+    hello()
+=======
+>>>>>>> REPLACE
+fsrb_test_env/sub_b/file_4.py
+<<<<<<< SEARCH
+x = 100
+y = 200
+print(x + y)
+=======
+>>>>>>> REPLACE
+```
+
+---
+
+### How to run them
+
+Since you are verifying the PowerShell script:
+
+1.  **Save the files** as `test_01_create.fsrb`, `test_02_modify.fsrb`, and `test_03_delete.fsrb`.
+2.  **Run:**
+    ```powershell
+    .\fsrb.ps1 test_01_create.fsrb
+    .\fsrb.ps1 test_02_modify.fsrb
+    .\fsrb.ps1 test_03_delete.fsrb
+    ```
