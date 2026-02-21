@@ -34,3 +34,6 @@ path/to/file.ext
    - **DELETE content / file:** non-empty SEARCH + empty REPLACE. If the final file becomes empty, the tool deletes the file; it may also remove now-empty parent directories (best-effort).
 
 **Goal:** Produce valid `.fsrb` output where every SEARCH block matches the target file exactly once.
+
+**Optimization Note:**
+- Small, targeted blocks are encouraged. You do NOT need to replace large chunks of code if only a few lines are changing. The tool handles context matching automatically.
