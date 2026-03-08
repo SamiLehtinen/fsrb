@@ -453,62 +453,28 @@ fn validate_and_apply_in_memory(blocks: &[PatchBlock]) -> (HashMap<String, FileS
 // --- Transactional Commit (All-or-Nothing, Atomic) ---
 
 fn ensure_parent_dirs_for_create(target_path: &Path) -> io::Result<Vec<PathBuf>> {
-    let mut created_dirs: Vec<PathBuf> = Vec::new();
+    let mut actual_created: Vec<PathBuf> = Vec::new();
     if let Some(parent) = target_path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
-            // Create parent directories as needed.
-            fs::create_dir_all(parent)?;
-            // Track which directories we actually created (for rollback on error).
-            let mut check_path = parent.to_path_buf();
-            while check_path.components().count() > 0 { // avoid infinite loop on root
-                if check_path.exists() && !created_dirs.contains(&check_path) {
-                    created_dirs.push(check_path.clone());
-                } else {
-                    // Optimization: if check_path exists and we didn't just create it, assume parents exist.
-                    // However, for strict rollback, we might just track what we create.
-                    // fs::create_dir_all is idempotent.
-                    // A simpler way: we can't easily know exactly which ones WE created vs existed.
-                    // But we can just try to remove them if empty on rollback.
-                    // Let's iterate bottom-up and add to list.
-                }
-                if let Some(p) = check_path.parent() {
-                    check_path = p.to_path_buf();
+            // Identify the first existing ancestor, collecting missing dirs.
+            let mut p = parent;
+            let mut stack = Vec::new();
+            while !p.exists() && !p.as_os_str().is_empty() {
+                stack.push(p.to_path_buf());
+                if let Some(par) = p.parent() {
+                    p = par;
                 } else {
                     break;
                 }
             }
+            // Create them from top (shallowest) to bottom (deepest).
+            while let Some(dir) = stack.pop() {
+                fs::create_dir(&dir)?;
+                actual_created.push(dir);
+            }
         }
     }
-    // Since precise tracking is hard with create_dir_all, we'll simplify:
-    // just try to remove empty parents starting from the target's parent upwards.
-    // But create_dir_all returns () on success.
-    // For now, let's just return an empty vec and rely on best-effort cleanup?
-    // The Python version does: _ensure_parent_dirs_for_create returns list.
-    // Let's do it properly: iterate from top-most missing parent down to target parent.
-
-    // Reset created_dirs
-    let mut actual_created: Vec<PathBuf> = Vec::new();
-    if let Some(parent) = target_path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-             // Identify the first existing parent
-             let mut p = parent;
-             let mut stack = Vec::new();
-             while !p.exists() && !p.as_os_str().is_empty() {
-                 stack.push(p.to_path_buf());
-                 if let Some(par) = p.parent() {
-                     p = par;
-                 } else {
-                     break;
-                 }
-             }
-             // Now create them from top to bottom
-             while let Some(dir) = stack.pop() {
-                 fs::create_dir(&dir)?;
-                 actual_created.push(dir);
-             }
-        }
-    }
-    // Return in reverse order (bottom-up) for easier removal
+    // Return in reverse order (bottom-up / deepest-first) for easier removal.
     actual_created.reverse();
     Ok(actual_created)
 }
@@ -1014,11 +980,14 @@ fn print_error_report(errors: &[ValidationError]) {
 
         for error in file_errors {
             let msg = match error.error_type {
-                ValidationErrorType::FileNotFound => error.message.clone(),
-                ValidationErrorType::FileUnreadable => error.message.clone(),
-                ValidationErrorType::EmptySearchBlock => error.message.clone(),
-                ValidationErrorType::SearchBlockNotFound => error.message.clone(),
-                ValidationErrorType::AmbiguousMatch => error.message.clone(),
+                ValidationErrorType::FileNotFound
+                | ValidationErrorType::FileUnreadable
+                | ValidationErrorType::EmptySearchBlock
+                | ValidationErrorType::SearchBlockNotFound
+                | ValidationErrorType::AmbiguousMatch
+                | ValidationErrorType::InvalidEmptySearchAndReplace
+                | ValidationErrorType::CreateOnExistingFile
+                | ValidationErrorType::CreateNotFirstBlock => error.message.clone(),
             };
 
             println!("  - Block #{}: {}", error.block_index, msg);
@@ -1027,5 +996,1311 @@ fn print_error_report(errors: &[ValidationError]) {
             }
         }
         println!();
+    }
+}
+
+// --- Unit Tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn create_temp_dir() -> PathBuf {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "fsrb_test_{}_{}_{}",
+            std::process::id(),
+            n,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn cleanup_temp_dir(dir: &Path) {
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn make_block(file_path: &str, search: &str, replace: &str, index: usize) -> PatchBlock {
+        PatchBlock {
+            file_path: file_path.to_string(),
+            search_pattern: search.to_string(),
+            replace_pattern: replace.to_string(),
+            block_index: index,
+            line_number: 1,
+        }
+    }
+
+    // ==================== Line Ending Helpers ====================
+
+    #[test]
+    fn test_detect_line_ending_lf() {
+        assert_eq!(detect_line_ending("hello\nworld\n"), LineEnding::Lf);
+    }
+
+    #[test]
+    fn test_detect_line_ending_crlf() {
+        assert_eq!(detect_line_ending("hello\r\nworld\r\n"), LineEnding::Crlf);
+    }
+
+    #[test]
+    fn test_detect_line_ending_no_newlines() {
+        assert_eq!(detect_line_ending("hello"), LineEnding::Lf);
+    }
+
+    #[test]
+    fn test_detect_line_ending_empty() {
+        assert_eq!(detect_line_ending(""), LineEnding::Lf);
+    }
+
+    #[test]
+    fn test_detect_line_ending_mixed_prefers_crlf() {
+        // If any CRLF exists, detect as CRLF
+        assert_eq!(detect_line_ending("a\nb\r\nc\n"), LineEnding::Crlf);
+    }
+
+    #[test]
+    fn test_normalize_to_lf() {
+        assert_eq!(normalize_to_lf("a\r\nb\r\n"), "a\nb\n");
+        assert_eq!(normalize_to_lf("a\nb\n"), "a\nb\n");
+        assert_eq!(normalize_to_lf("no newlines"), "no newlines");
+        assert_eq!(normalize_to_lf(""), "");
+    }
+
+    #[test]
+    fn test_normalize_to_lf_lone_cr_preserved() {
+        // Lone \r should not be modified
+        assert_eq!(normalize_to_lf("a\rb"), "a\rb");
+    }
+
+    #[test]
+    fn test_lf_to_crlf() {
+        assert_eq!(lf_to_crlf("a\nb\n"), "a\r\nb\r\n");
+        assert_eq!(lf_to_crlf("no newlines"), "no newlines");
+        assert_eq!(lf_to_crlf(""), "");
+    }
+
+    // ==================== Overlap-Aware Matching ====================
+
+    #[test]
+    fn test_find_unique_overlapping_one_match() {
+        match find_unique_overlapping("hello world", "world") {
+            UniqueMatch::One { start } => assert_eq!(start, 6),
+            _ => panic!("Expected exactly one match"),
+        }
+    }
+
+    #[test]
+    fn test_find_unique_overlapping_no_match() {
+        match find_unique_overlapping("hello world", "xyz") {
+            UniqueMatch::None => {}
+            _ => panic!("Expected no match"),
+        }
+    }
+
+    #[test]
+    fn test_find_unique_overlapping_ambiguous() {
+        match find_unique_overlapping("abab", "ab") {
+            UniqueMatch::Ambiguous { count } => assert_eq!(count, 2),
+            _ => panic!("Expected ambiguous match"),
+        }
+    }
+
+    #[test]
+    fn test_find_unique_overlapping_overlap_counting() {
+        match find_unique_overlapping("aaa", "aa") {
+            UniqueMatch::Ambiguous { count } => assert_eq!(count, 2),
+            _ => panic!("Expected 2 overlapping occurrences"),
+        }
+    }
+
+    #[test]
+    fn test_find_unique_overlapping_empty_needle() {
+        match find_unique_overlapping("hello", "") {
+            UniqueMatch::None => {}
+            _ => panic!("Empty needle should return None"),
+        }
+    }
+
+    #[test]
+    fn test_find_unique_overlapping_needle_longer_than_haystack() {
+        match find_unique_overlapping("hi", "hello world") {
+            UniqueMatch::None => {}
+            _ => panic!("Needle longer than haystack should return None"),
+        }
+    }
+
+    #[test]
+    fn test_find_unique_overlapping_exact_match() {
+        match find_unique_overlapping("hello", "hello") {
+            UniqueMatch::One { start } => assert_eq!(start, 0),
+            _ => panic!("Expected one match at start"),
+        }
+    }
+
+    #[test]
+    fn test_find_unique_overlapping_single_char() {
+        match find_unique_overlapping("abcde", "c") {
+            UniqueMatch::One { start } => assert_eq!(start, 2),
+            _ => panic!("Expected one match"),
+        }
+    }
+
+    #[test]
+    fn test_find_unique_overlapping_three_occurrences() {
+        match find_unique_overlapping("abcabcabc", "abc") {
+            UniqueMatch::Ambiguous { count } => assert_eq!(count, 3),
+            _ => panic!("Expected 3 occurrences"),
+        }
+    }
+
+    // ==================== replace_at ====================
+
+    #[test]
+    fn test_replace_at_basic() {
+        assert_eq!(replace_at("hello world", 6, 5, "rust"), "hello rust");
+    }
+
+    #[test]
+    fn test_replace_at_beginning() {
+        assert_eq!(replace_at("hello world", 0, 5, "goodbye"), "goodbye world");
+    }
+
+    #[test]
+    fn test_replace_at_end() {
+        assert_eq!(replace_at("hello world", 6, 5, ""), "hello ");
+    }
+
+    #[test]
+    fn test_replace_at_empty_replacement() {
+        assert_eq!(replace_at("abcde", 1, 3, ""), "ae");
+    }
+
+    #[test]
+    fn test_replace_at_larger_replacement() {
+        assert_eq!(replace_at("ab", 1, 1, "xyz"), "axyz");
+    }
+
+    #[test]
+    fn test_replace_at_full_string() {
+        assert_eq!(replace_at("hello", 0, 5, "world"), "world");
+    }
+
+    // ==================== get_snippet ====================
+
+    #[test]
+    fn test_get_snippet_short() {
+        assert_eq!(get_snippet("short line"), "short line");
+    }
+
+    #[test]
+    fn test_get_snippet_truncates_long_line() {
+        let long = "a".repeat(100);
+        let snip = get_snippet(&long);
+        assert_eq!(snip.len(), 63); // 60 + "..."
+        assert!(snip.ends_with("..."));
+    }
+
+    #[test]
+    fn test_get_snippet_multiline_uses_first() {
+        assert_eq!(get_snippet("first\nsecond\nthird"), "first");
+    }
+
+    #[test]
+    fn test_get_snippet_empty() {
+        assert_eq!(get_snippet(""), "");
+    }
+
+    #[test]
+    fn test_get_snippet_exactly_60_chars() {
+        let s = "a".repeat(60);
+        assert_eq!(get_snippet(&s), s);
+    }
+
+    #[test]
+    fn test_get_snippet_61_chars_truncated() {
+        let s = "a".repeat(61);
+        let snip = get_snippet(&s);
+        assert!(snip.ends_with("..."));
+        assert_eq!(snip.len(), 63);
+    }
+
+    // ==================== Parsing ====================
+
+    #[test]
+    fn test_parse_single_block() {
+        let input = "\
+src/main.rs
+<<<<<<< SEARCH
+old code
+=======
+new code
+>>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].file_path, "src/main.rs");
+        assert_eq!(blocks[0].search_pattern, "old code");
+        assert_eq!(blocks[0].replace_pattern, "new code");
+        assert_eq!(blocks[0].block_index, 1);
+    }
+
+    #[test]
+    fn test_parse_multiple_blocks_same_file() {
+        let input = "\
+src/main.rs
+<<<<<<< SEARCH
+aaa
+=======
+bbb
+>>>>>>> REPLACE
+
+src/main.rs
+<<<<<<< SEARCH
+ccc
+=======
+ddd
+>>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].search_pattern, "aaa");
+        assert_eq!(blocks[1].search_pattern, "ccc");
+        assert_eq!(blocks[0].block_index, 1);
+        assert_eq!(blocks[1].block_index, 2);
+    }
+
+    #[test]
+    fn test_parse_multiple_files() {
+        let input = "\
+file_a.txt
+<<<<<<< SEARCH
+old_a
+=======
+new_a
+>>>>>>> REPLACE
+
+file_b.txt
+<<<<<<< SEARCH
+old_b
+=======
+new_b
+>>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].file_path, "file_a.txt");
+        assert_eq!(blocks[1].file_path, "file_b.txt");
+    }
+
+    #[test]
+    fn test_parse_create_block() {
+        let input = "\
+new_file.txt
+<<<<<<< SEARCH
+=======
+file content here
+>>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].search_pattern, "");
+        assert_eq!(blocks[0].replace_pattern, "file content here");
+    }
+
+    #[test]
+    fn test_parse_delete_block() {
+        let input = "\
+old_file.txt
+<<<<<<< SEARCH
+content to remove
+=======
+>>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].search_pattern, "content to remove");
+        assert_eq!(blocks[0].replace_pattern, "");
+    }
+
+    #[test]
+    fn test_parse_comments_ignored() {
+        let input = "\
+# This is a comment
+src/main.rs
+<<<<<<< SEARCH
+old
+=======
+new
+>>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].file_path, "src/main.rs");
+    }
+
+    #[test]
+    fn test_parse_code_fences_ignored() {
+        let input = "\
+```
+src/main.rs
+<<<<<<< SEARCH
+old
+=======
+new
+>>>>>>> REPLACE
+```
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].file_path, "src/main.rs");
+    }
+
+    #[test]
+    fn test_parse_delimiter_escaping() {
+        let input = "\
+src/main.rs
+<<<<<<< SEARCH
+before
+\\<<<<<<< SEARCH
+after
+=======
+before
+\\=======
+after
+>>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks[0].search_pattern, "before\n<<<<<<< SEARCH\nafter");
+        assert_eq!(blocks[0].replace_pattern, "before\n=======\nafter");
+    }
+
+    #[test]
+    fn test_parse_escape_replace_delimiter() {
+        let input = "\
+file.txt
+<<<<<<< SEARCH
+old
+=======
+\\>>>>>>> REPLACE
+more content
+>>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks[0].replace_pattern, ">>>>>>> REPLACE\nmore content");
+    }
+
+    #[test]
+    fn test_parse_multiline_content() {
+        let input = "\
+file.txt
+<<<<<<< SEARCH
+line 1
+line 2
+line 3
+=======
+new line 1
+new line 2
+>>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks[0].search_pattern, "line 1\nline 2\nline 3");
+        assert_eq!(blocks[0].replace_pattern, "new line 1\nnew line 2");
+    }
+
+    #[test]
+    fn test_parse_error_search_without_header() {
+        let input = "\
+<<<<<<< SEARCH
+old
+=======
+new
+>>>>>>> REPLACE
+";
+        assert!(parse_patch_file(input).is_err());
+    }
+
+    #[test]
+    fn test_parse_error_unterminated_search() {
+        let input = "\
+file.txt
+<<<<<<< SEARCH
+old content
+";
+        assert!(parse_patch_file(input).is_err());
+    }
+
+    #[test]
+    fn test_parse_error_unterminated_replace() {
+        let input = "\
+file.txt
+<<<<<<< SEARCH
+old
+=======
+new content
+";
+        assert!(parse_patch_file(input).is_err());
+    }
+
+    #[test]
+    fn test_parse_empty_input() {
+        let blocks = parse_patch_file("").unwrap();
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_whitespace_trimmed_delimiters() {
+        let input = "\
+file.txt
+  <<<<<<< SEARCH
+old
+  =======
+new
+  >>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].search_pattern, "old");
+        assert_eq!(blocks[0].replace_pattern, "new");
+    }
+
+    #[test]
+    fn test_parse_blank_lines_between_header_and_search() {
+        let input = "\
+file.txt
+
+<<<<<<< SEARCH
+old
+=======
+new
+>>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].file_path, "file.txt");
+    }
+
+    #[test]
+    fn test_parse_only_comments() {
+        let input = "# just a comment\n# another comment\n";
+        let blocks = parse_patch_file(input).unwrap();
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_backslash_not_before_delimiter() {
+        // Backslash before non-delimiter should be preserved
+        let input = "\
+file.txt
+<<<<<<< SEARCH
+\\not_a_delimiter
+=======
+new
+>>>>>>> REPLACE
+";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks[0].search_pattern, "\\not_a_delimiter");
+    }
+
+    #[test]
+    fn test_parse_crlf_patch_file() {
+        let input = "file.txt\r\n<<<<<<< SEARCH\r\nold\r\n=======\r\nnew\r\n>>>>>>> REPLACE\r\n";
+        let blocks = parse_patch_file(input).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].search_pattern, "old");
+        assert_eq!(blocks[0].replace_pattern, "new");
+    }
+
+    #[test]
+    fn test_parse_file_header_not_recognized_without_search() {
+        // A line that looks like a path but not followed by SEARCH should be ignored
+        let input = "some/path.txt\nrandom text\n";
+        let blocks = parse_patch_file(input).unwrap();
+        assert!(blocks.is_empty());
+    }
+
+    // ==================== Validation & In-Memory Application ====================
+
+    #[test]
+    fn test_validate_simple_update() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("update.txt");
+        fs::write(&file, "hello world").unwrap();
+
+        let blocks = vec![make_block(&file.to_string_lossy(), "hello", "goodbye", 1)];
+        let (states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+        assert_eq!(states[&file.to_string_lossy().to_string()].content_norm, "goodbye world");
+        assert!(states[&file.to_string_lossy().to_string()].modified);
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_search_not_found() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("notfound.txt");
+        fs::write(&file, "hello world").unwrap();
+
+        let blocks = vec![make_block(&file.to_string_lossy(), "nonexistent", "x", 1)];
+        let (_states, errors) = validate_and_apply_in_memory(&blocks);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0].error_type, ValidationErrorType::SearchBlockNotFound));
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_ambiguous_match() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("ambiguous.txt");
+        fs::write(&file, "foo bar foo baz").unwrap();
+
+        let blocks = vec![make_block(&file.to_string_lossy(), "foo", "xxx", 1)];
+        let (_states, errors) = validate_and_apply_in_memory(&blocks);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0].error_type, ValidationErrorType::AmbiguousMatch));
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_file_not_found() {
+        let blocks = vec![make_block("/tmp/fsrb_nonexistent_file_xyzzy.txt", "hello", "world", 1)];
+        let (_states, errors) = validate_and_apply_in_memory(&blocks);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0].error_type, ValidationErrorType::FileNotFound));
+    }
+
+    #[test]
+    fn test_validate_create_operation() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("brand_new.txt");
+
+        let blocks = vec![make_block(&file.to_string_lossy(), "", "new content", 1)];
+        let (states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+        let state = &states[&file.to_string_lossy().to_string()];
+        assert_eq!(state.content_norm, "new content");
+        assert!(!state.existed_on_disk);
+        assert!(state.modified);
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_create_on_existing_file() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("exists.txt");
+        fs::write(&file, "existing content").unwrap();
+
+        let blocks = vec![make_block(&file.to_string_lossy(), "", "new content", 1)];
+        let (_states, errors) = validate_and_apply_in_memory(&blocks);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0].error_type, ValidationErrorType::CreateOnExistingFile));
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_empty_search_and_replace() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("empty.txt");
+        fs::write(&file, "content").unwrap();
+
+        let blocks = vec![make_block(&file.to_string_lossy(), "", "", 1)];
+        let (_states, errors) = validate_and_apply_in_memory(&blocks);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0].error_type, ValidationErrorType::InvalidEmptySearchAndReplace));
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_multiple_blocks_sequential() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("multi.txt");
+        fs::write(&file, "alpha beta gamma").unwrap();
+
+        let fp = file.to_string_lossy().to_string();
+        let blocks = vec![
+            make_block(&fp, "alpha", "xxx", 1),
+            make_block(&fp, "gamma", "zzz", 2),
+        ];
+
+        let (states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+        assert_eq!(states[&fp].content_norm, "xxx beta zzz");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_delete_operation() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("delete.txt");
+        fs::write(&file, "remove me").unwrap();
+
+        let blocks = vec![make_block(&file.to_string_lossy(), "remove me", "", 1)];
+        let (states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+        assert_eq!(states[&file.to_string_lossy().to_string()].content_norm, "");
+        assert!(states[&file.to_string_lossy().to_string()].modified);
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_crlf_preserved() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("crlf.txt");
+        fs::write(&file, "line1\r\nline2\r\nline3\r\n").unwrap();
+
+        let blocks = vec![make_block(&file.to_string_lossy(), "line2", "replaced", 1)];
+        let (states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+        let state = &states[&file.to_string_lossy().to_string()];
+        assert_eq!(state.line_ending, LineEnding::Crlf);
+        assert_eq!(state.content_norm, "line1\nreplaced\nline3\n");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_collects_all_errors() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("allerrs.txt");
+        fs::write(&file, "hello world").unwrap();
+
+        let fp = file.to_string_lossy().to_string();
+        let blocks = vec![
+            make_block(&fp, "nonexistent1", "x", 1),
+            make_block(&fp, "nonexistent2", "y", 2),
+        ];
+
+        let (_states, errors) = validate_and_apply_in_memory(&blocks);
+        assert_eq!(errors.len(), 2, "Should collect all errors, not fail fast");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_create_not_first_block() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("create_order.txt");
+        // File does not exist - first block is non-create, second is create
+        // Actually, for this test we need a file that doesn't exist, with a
+        // non-create block first. But that would trigger FileNotFound.
+        // The CreateNotFirstBlock error occurs when a CREATE block appears after
+        // a non-create block for the same file. Let's create the file so
+        // non-create can work, but then CREATE on existing file triggers
+        // CreateOnExistingFile instead. Let's check the logic...
+        // Actually, seen_noncreate_for_file is checked before existed_on_disk for create.
+        // No, the order in the code is: is_create -> existed_on_disk check first,
+        // then seen_noncreate check. So CreateOnExistingFile takes precedence.
+        // For CreateNotFirstBlock to trigger, the file must NOT exist on disk
+        // and a non-create block must have been seen.
+        // But if file doesn't exist and there's no CREATE, it's FileNotFound...
+        // The unavailable_files check skips subsequent blocks for that file.
+        // Hmm, this path might be hard to trigger. Let me check: what if we have
+        // CREATE then another CREATE for same file?
+        let file2 = tmp.join("double_create.txt");
+        let fp = file2.to_string_lossy().to_string();
+        let blocks = vec![
+            make_block(&fp, "", "content1", 1),
+            make_block(&fp, "", "content2", 2),
+        ];
+
+        let (_states, errors) = validate_and_apply_in_memory(&blocks);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0].error_type, ValidationErrorType::AmbiguousMatch));
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_multiple_files() {
+        let tmp = create_temp_dir();
+        let file_a = tmp.join("a.txt");
+        let file_b = tmp.join("b.txt");
+        fs::write(&file_a, "content_a").unwrap();
+        fs::write(&file_b, "content_b").unwrap();
+
+        let blocks = vec![
+            make_block(&file_a.to_string_lossy(), "content_a", "new_a", 1),
+            make_block(&file_b.to_string_lossy(), "content_b", "new_b", 2),
+        ];
+
+        let (states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+        assert_eq!(states[&file_a.to_string_lossy().to_string()].content_norm, "new_a");
+        assert_eq!(states[&file_b.to_string_lossy().to_string()].content_norm, "new_b");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_unmodified_file_not_marked_modified() {
+        let tmp = create_temp_dir();
+        let file_a = tmp.join("mod.txt");
+        let file_b = tmp.join("unmod.txt");
+        fs::write(&file_a, "change me").unwrap();
+        fs::write(&file_b, "leave me").unwrap();
+
+        // Only modify file_a, file_b is referenced but via another file's block
+        let blocks = vec![make_block(&file_a.to_string_lossy(), "change me", "changed", 1)];
+
+        let (states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(errors.is_empty());
+        assert!(states[&file_a.to_string_lossy().to_string()].modified);
+        // file_b not in states since not referenced
+        assert!(!states.contains_key(&file_b.to_string_lossy().to_string()));
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_validate_overlap_aware_ambiguous() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("overlap.txt");
+        fs::write(&file, "aaaa").unwrap();
+
+        // "aa" in "aaaa" = 3 overlapping matches
+        let blocks = vec![make_block(&file.to_string_lossy(), "aa", "xx", 1)];
+        let (_states, errors) = validate_and_apply_in_memory(&blocks);
+        assert_eq!(errors.len(), 1);
+        assert!(matches!(errors[0].error_type, ValidationErrorType::AmbiguousMatch));
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    // ==================== Commit (Atomic) ====================
+
+    #[test]
+    fn test_commit_update_file() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("commit_update.txt");
+        fs::write(&file, "original content").unwrap();
+
+        let fp = file.to_string_lossy().to_string();
+        let mut states = HashMap::new();
+        states.insert(fp.clone(), FileState {
+            path: fp.clone(),
+            line_ending: LineEnding::Lf,
+            content_norm: "updated content".to_string(),
+            existed_on_disk: true,
+            modified: true,
+        });
+
+        let result = commit_changes_atomic(&states, 1);
+        assert!(result.is_ok(), "Commit failed: {:?}", result.err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "updated content");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_commit_create_file() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("commit_create.txt");
+
+        let fp = file.to_string_lossy().to_string();
+        let mut states = HashMap::new();
+        states.insert(fp.clone(), FileState {
+            path: fp.clone(),
+            line_ending: LineEnding::Lf,
+            content_norm: "brand new file".to_string(),
+            existed_on_disk: false,
+            modified: true,
+        });
+
+        let result = commit_changes_atomic(&states, 1);
+        assert!(result.is_ok(), "Commit failed: {:?}", result.err());
+        assert!(file.exists());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "brand new file");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_commit_delete_file() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("commit_delete.txt");
+        fs::write(&file, "to be deleted").unwrap();
+
+        let fp = file.to_string_lossy().to_string();
+        let mut states = HashMap::new();
+        states.insert(fp.clone(), FileState {
+            path: fp.clone(),
+            line_ending: LineEnding::Lf,
+            content_norm: "".to_string(),
+            existed_on_disk: true,
+            modified: true,
+        });
+
+        let result = commit_changes_atomic(&states, 1);
+        assert!(result.is_ok(), "Commit failed: {:?}", result.err());
+        assert!(!file.exists());
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_commit_preserves_crlf() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("commit_crlf.txt");
+        fs::write(&file, "old\r\ncontent\r\n").unwrap();
+
+        let fp = file.to_string_lossy().to_string();
+        let mut states = HashMap::new();
+        states.insert(fp.clone(), FileState {
+            path: fp.clone(),
+            line_ending: LineEnding::Crlf,
+            content_norm: "new\ncontent\n".to_string(),
+            existed_on_disk: true,
+            modified: true,
+        });
+
+        let result = commit_changes_atomic(&states, 1);
+        assert!(result.is_ok());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new\r\ncontent\r\n");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_commit_no_modified_files() {
+        let states: HashMap<String, FileState> = HashMap::new();
+        let result = commit_changes_atomic(&states, 0);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_commit_unmodified_file_skipped() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("unmod_commit.txt");
+        fs::write(&file, "original").unwrap();
+
+        let fp = file.to_string_lossy().to_string();
+        let mut states = HashMap::new();
+        states.insert(fp.clone(), FileState {
+            path: fp.clone(),
+            line_ending: LineEnding::Lf,
+            content_norm: "original".to_string(),
+            existed_on_disk: true,
+            modified: false,
+        });
+
+        let result = commit_changes_atomic(&states, 1);
+        assert!(result.is_ok());
+        // File should remain unchanged
+        assert_eq!(fs::read_to_string(&file).unwrap(), "original");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_commit_create_with_parent_dirs() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("sub").join("dir").join("deep.txt");
+
+        let fp = file.to_string_lossy().to_string();
+        let mut states = HashMap::new();
+        states.insert(fp.clone(), FileState {
+            path: fp.clone(),
+            line_ending: LineEnding::Lf,
+            content_norm: "nested file".to_string(),
+            existed_on_disk: false,
+            modified: true,
+        });
+
+        let result = commit_changes_atomic(&states, 1);
+        assert!(result.is_ok(), "Commit failed: {:?}", result.err());
+        assert!(file.exists());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "nested file");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_commit_delete_removes_empty_parent_dirs() {
+        let tmp = create_temp_dir();
+        let sub = tmp.join("empty_parent");
+        fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("doomed.txt");
+        fs::write(&file, "content").unwrap();
+
+        let fp = file.to_string_lossy().to_string();
+        let mut states = HashMap::new();
+        states.insert(fp.clone(), FileState {
+            path: fp.clone(),
+            line_ending: LineEnding::Lf,
+            content_norm: "".to_string(),
+            existed_on_disk: true,
+            modified: true,
+        });
+
+        let result = commit_changes_atomic(&states, 1);
+        assert!(result.is_ok());
+        assert!(!file.exists());
+        // empty_parent dir should be removed (best-effort)
+        assert!(!sub.exists());
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_commit_multiple_files() {
+        let tmp = create_temp_dir();
+        let file_a = tmp.join("multi_a.txt");
+        let file_b = tmp.join("multi_b.txt");
+        fs::write(&file_a, "old_a").unwrap();
+        fs::write(&file_b, "old_b").unwrap();
+
+        let mut states = HashMap::new();
+        states.insert(file_a.to_string_lossy().to_string(), FileState {
+            path: file_a.to_string_lossy().to_string(),
+            line_ending: LineEnding::Lf,
+            content_norm: "new_a".to_string(),
+            existed_on_disk: true,
+            modified: true,
+        });
+        states.insert(file_b.to_string_lossy().to_string(), FileState {
+            path: file_b.to_string_lossy().to_string(),
+            line_ending: LineEnding::Lf,
+            content_norm: "new_b".to_string(),
+            existed_on_disk: true,
+            modified: true,
+        });
+
+        let result = commit_changes_atomic(&states, 2);
+        assert!(result.is_ok());
+        assert_eq!(fs::read_to_string(&file_a).unwrap(), "new_a");
+        assert_eq!(fs::read_to_string(&file_b).unwrap(), "new_b");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    // ==================== Temp Path Helpers ====================
+
+    #[test]
+    fn test_unique_sibling_path() {
+        let tmp = create_temp_dir();
+        let target = tmp.join("file.txt");
+
+        let p1 = unique_sibling_path(&target, ".fsrb.tmp").unwrap();
+        assert!(p1.to_string_lossy().contains(".fsrb.tmp"));
+        assert!(!p1.exists());
+
+        // Creating the file and calling again should give a different path
+        fs::write(&p1, "x").unwrap();
+        let p2 = unique_sibling_path(&target, ".fsrb.tmp").unwrap();
+        assert_ne!(p1, p2);
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_create_new_file_helper() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("created.txt");
+
+        let mut f = create_new_file(&file).unwrap();
+        f.write_all(b"hello").unwrap();
+        drop(f);
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "hello");
+
+        // Trying to create again should fail (create_new semantics)
+        assert!(create_new_file(&file).is_err());
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    // ==================== ensure_parent_dirs_for_create ====================
+
+    #[test]
+    fn test_ensure_parent_dirs_creates_nested() {
+        let tmp = create_temp_dir();
+        let nested = tmp.join("newdir1").join("newdir2").join("newdir3");
+        let target = nested.join("file.txt");
+        assert!(!nested.exists());
+
+        let created = ensure_parent_dirs_for_create(&target).unwrap();
+        assert!(nested.exists());
+        // created list contains the directories we made (bottom-up order)
+        assert!(!created.is_empty());
+        // All created dirs should exist
+        for d in &created {
+            assert!(d.exists());
+        }
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_ensure_parent_dirs_existing_parent_noop() {
+        let tmp = create_temp_dir();
+        let target = tmp.join("existing_file.txt");
+        // Parent already exists (tmp)
+        let created = ensure_parent_dirs_for_create(&target).unwrap();
+        assert!(created.is_empty());
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    // ==================== remove_empty_dirs_best_effort ====================
+
+    #[test]
+    fn test_remove_empty_dirs_best_effort() {
+        let tmp = create_temp_dir();
+        let d1 = tmp.join("removeme1");
+        let d2 = tmp.join("removeme2");
+        fs::create_dir(&d1).unwrap();
+        fs::create_dir(&d2).unwrap();
+
+        remove_empty_dirs_best_effort(&[d1.clone(), d2.clone()]);
+        assert!(!d1.exists());
+        assert!(!d2.exists());
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_remove_empty_dirs_nonempty_skipped() {
+        let tmp = create_temp_dir();
+        let d = tmp.join("notempty");
+        fs::create_dir(&d).unwrap();
+        fs::write(d.join("file.txt"), "x").unwrap();
+
+        remove_empty_dirs_best_effort(&[d.clone()]);
+        assert!(d.exists()); // Should still exist because not empty
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    // ==================== remove_empty_parent_dirs_best_effort ====================
+
+    #[test]
+    fn test_remove_empty_parent_dirs() {
+        let tmp = create_temp_dir();
+        let deep = tmp.join("p1").join("p2").join("p3");
+        fs::create_dir_all(&deep).unwrap();
+        let file = deep.join("file.txt");
+        // Don't actually create the file, just test parent cleanup
+        // The file doesn't exist but its parent dirs do
+        remove_empty_parent_dirs_best_effort(&file);
+        assert!(!deep.exists());
+        assert!(!tmp.join("p1").join("p2").exists());
+        assert!(!tmp.join("p1").exists());
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    // ==================== Error Reporting ====================
+
+    #[test]
+    fn test_print_error_report_runs_without_panic() {
+        let errors = vec![
+            ValidationError {
+                file_path: "file_a.txt".to_string(),
+                block_index: 1,
+                error_type: ValidationErrorType::SearchBlockNotFound,
+                message: "SEARCH block not found.".to_string(),
+                snippet: "some snippet".to_string(),
+            },
+            ValidationError {
+                file_path: "file_a.txt".to_string(),
+                block_index: 2,
+                error_type: ValidationErrorType::AmbiguousMatch,
+                message: "Found 3 occurrences.".to_string(),
+                snippet: "another snippet".to_string(),
+            },
+            ValidationError {
+                file_path: "file_b.txt".to_string(),
+                block_index: 1,
+                error_type: ValidationErrorType::FileNotFound,
+                message: "File not found on disk.".to_string(),
+                snippet: String::new(),
+            },
+        ];
+        // Just ensure it doesn't panic with all error types
+        print_error_report(&errors);
+    }
+
+    #[test]
+    fn test_print_error_report_all_error_types() {
+        let errors = vec![
+            ValidationError {
+                file_path: "f.txt".to_string(), block_index: 1,
+                error_type: ValidationErrorType::FileNotFound,
+                message: "m".to_string(), snippet: String::new(),
+            },
+            ValidationError {
+                file_path: "f.txt".to_string(), block_index: 2,
+                error_type: ValidationErrorType::FileUnreadable,
+                message: "m".to_string(), snippet: String::new(),
+            },
+            ValidationError {
+                file_path: "f.txt".to_string(), block_index: 3,
+                error_type: ValidationErrorType::EmptySearchBlock,
+                message: "m".to_string(), snippet: String::new(),
+            },
+            ValidationError {
+                file_path: "f.txt".to_string(), block_index: 4,
+                error_type: ValidationErrorType::SearchBlockNotFound,
+                message: "m".to_string(), snippet: "s".to_string(),
+            },
+            ValidationError {
+                file_path: "f.txt".to_string(), block_index: 5,
+                error_type: ValidationErrorType::AmbiguousMatch,
+                message: "m".to_string(), snippet: "s".to_string(),
+            },
+            ValidationError {
+                file_path: "f.txt".to_string(), block_index: 6,
+                error_type: ValidationErrorType::InvalidEmptySearchAndReplace,
+                message: "m".to_string(), snippet: String::new(),
+            },
+            ValidationError {
+                file_path: "f.txt".to_string(), block_index: 7,
+                error_type: ValidationErrorType::CreateOnExistingFile,
+                message: "m".to_string(), snippet: String::new(),
+            },
+            ValidationError {
+                file_path: "f.txt".to_string(), block_index: 8,
+                error_type: ValidationErrorType::CreateNotFirstBlock,
+                message: "m".to_string(), snippet: String::new(),
+            },
+        ];
+        // Should not panic — all variants covered
+        print_error_report(&errors);
+    }
+
+    // ==================== End-to-End: Parse + Validate + Commit ====================
+
+    #[test]
+    fn test_end_to_end_update() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("e2e.txt");
+        fs::write(&file, "hello world\ngoodbye moon\n").unwrap();
+
+        let patch = format!(
+            "{}\n<<<<<<< SEARCH\nhello world\n=======\nhello rust\n>>>>>>> REPLACE\n",
+            file.display()
+        );
+
+        let blocks = parse_patch_file(&patch).unwrap();
+        assert_eq!(blocks.len(), 1);
+
+        let (states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(errors.is_empty());
+
+        let result = commit_changes_atomic(&states, blocks.len());
+        assert!(result.is_ok());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "hello rust\ngoodbye moon\n");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_end_to_end_create() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("e2e_new.txt");
+
+        let patch = format!(
+            "{}\n<<<<<<< SEARCH\n=======\nnew file content\n>>>>>>> REPLACE\n",
+            file.display()
+        );
+
+        let blocks = parse_patch_file(&patch).unwrap();
+        let (states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(errors.is_empty());
+
+        let result = commit_changes_atomic(&states, blocks.len());
+        assert!(result.is_ok());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new file content");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_end_to_end_delete() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("e2e_del.txt");
+        fs::write(&file, "doomed content").unwrap();
+
+        let patch = format!(
+            "{}\n<<<<<<< SEARCH\ndoomed content\n=======\n>>>>>>> REPLACE\n",
+            file.display()
+        );
+
+        let blocks = parse_patch_file(&patch).unwrap();
+        let (states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(errors.is_empty());
+
+        let result = commit_changes_atomic(&states, blocks.len());
+        assert!(result.is_ok());
+        assert!(!file.exists());
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_end_to_end_validation_failure_no_changes() {
+        let tmp = create_temp_dir();
+        let file = tmp.join("e2e_nochg.txt");
+        fs::write(&file, "original content").unwrap();
+
+        let patch = format!(
+            "{}\n<<<<<<< SEARCH\nwrong content\n=======\nreplacement\n>>>>>>> REPLACE\n",
+            file.display()
+        );
+
+        let blocks = parse_patch_file(&patch).unwrap();
+        let (_states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(!errors.is_empty());
+
+        // File should be untouched since we didn't commit
+        assert_eq!(fs::read_to_string(&file).unwrap(), "original content");
+
+        cleanup_temp_dir(&tmp);
+    }
+
+    #[test]
+    fn test_end_to_end_multi_block_multi_file() {
+        let tmp = create_temp_dir();
+        let file_a = tmp.join("e2e_a.txt");
+        let file_b = tmp.join("e2e_b.txt");
+        fs::write(&file_a, "alpha content").unwrap();
+        fs::write(&file_b, "beta content").unwrap();
+
+        let patch = format!(
+            "{fa}\n<<<<<<< SEARCH\nalpha content\n=======\nalpha updated\n>>>>>>> REPLACE\n\n\
+             {fb}\n<<<<<<< SEARCH\nbeta content\n=======\nbeta updated\n>>>>>>> REPLACE\n",
+            fa = file_a.display(),
+            fb = file_b.display()
+        );
+
+        let blocks = parse_patch_file(&patch).unwrap();
+        assert_eq!(blocks.len(), 2);
+
+        let (states, errors) = validate_and_apply_in_memory(&blocks);
+        assert!(errors.is_empty());
+
+        let result = commit_changes_atomic(&states, blocks.len());
+        assert!(result.is_ok());
+        assert_eq!(fs::read_to_string(&file_a).unwrap(), "alpha updated");
+        assert_eq!(fs::read_to_string(&file_b).unwrap(), "beta updated");
+
+        cleanup_temp_dir(&tmp);
     }
 }

@@ -132,6 +132,14 @@ File: README.md
 *   **0**: Success. All blocks in all files were applied.
 *   **1**: Failure. One or more validation errors occurred (file not found, unreadable file, empty SEARCH, block not found, ambiguous match). No changes were applied.
 
+## TESTING
+
+The Rust implementation includes unit tests. No Cargo setup is required — compile and run with `rustc --test`:
+
+```bash
+rustc --test src/fsrb.rs -o /tmp/fsrb_test && /tmp/fsrb_test
+```
+
 ## SEE ALSO
 `diff(1)`, `patch(1)`, `sed(1)`
 
