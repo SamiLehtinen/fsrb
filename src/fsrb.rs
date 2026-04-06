@@ -1019,6 +1019,9 @@ fn print_error_report(errors: &[ValidationError]) {
                 ValidationErrorType::EmptySearchBlock => error.message.clone(),
                 ValidationErrorType::SearchBlockNotFound => error.message.clone(),
                 ValidationErrorType::AmbiguousMatch => error.message.clone(),
+                ValidationErrorType::InvalidEmptySearchAndReplace => error.message.clone(),
+                ValidationErrorType::CreateOnExistingFile => error.message.clone(),
+                ValidationErrorType::CreateNotFirstBlock => error.message.clone(),
             };
 
             println!("  - Block #{}: {}", error.block_index, msg);
